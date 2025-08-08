@@ -380,7 +380,7 @@ _CONFIGS = [
     ###
     # pi0_base by lora
     TrainConfig(
-        name="pi0_base_aloha_robotwin_lora",
+        name="pi0_base_agibot_lora",
         model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotAlohaDataConfig(
             repo_id="test",  # your datasets repo_id
@@ -388,12 +388,12 @@ _CONFIGS = [
             repack_transforms=_transforms.Group(inputs=[
                 _transforms.RepackTransform({
                     "images": {
-                        "cam_high": "observation.images.cam_high",
-                        "cam_left_wrist": "observation.images.cam_left_wrist",
-                        "cam_right_wrist": "observation.images.cam_right_wrist",
+                        "cam_high": "observation.images.head",
+                        "cam_left_wrist": "observation.images.hand_left",
+                        "cam_right_wrist": "observation.images.hand_right",
                     },
-                    "state": "observation.state",
-                    "actions": "action",
+                    "state": "observation.states",
+                    "actions": "actions",
                     "prompt": "prompt",
                 })
             ]),
