@@ -2,22 +2,26 @@
 # docker compose -f scripts/compose.yml up --build
 services:
   openpi_server:
-    image: openpi_server
-    build:
-      context: ..
-      dockerfile: scripts/docker/serve_policy.Dockerfile
+    image: pizero_server:latest
+    # build:
+    #   context: ..
+    #   dockerfile: scripts/docker/serve_policy.Dockerfile
     init: true
     tty: true
     network_mode: host
+    command: bash # ← 进入容器就启动 bash
     # Populate configured openpi data home to /openpi_assets inside the container.
     # Populate aws credential inside the container.
     volumes:
       - $PWD:/app
       - ${OPENPI_DATA_HOME:-~/.cache/openpi}:/openpi_assets
+      - /data2/qeli/datasets/Manipulation-SimData:/dataset
     environment:
       - SERVER_ARGS
       - OPENPI_DATA_HOME=/openpi_assets
       - IS_DOCKER=true
+      - http_proxy=http://127.0.0.1:1080
+      - https_proxy=http://127.0.0.1:1080
 
     # Comment out this block if not running on a machine with GPUs.
     deploy:
@@ -25,5 +29,6 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+              # count: 1
+              capabilities: [ gpu ]
+              device_ids: [ "1" ] # 挂第 1 号 GPU

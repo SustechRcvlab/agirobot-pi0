@@ -102,6 +102,7 @@ class RepackTransform(DataTransformFn):
     structure: at.PyTree[str]
 
     def __call__(self, data: DataDict) -> DataDict:
+        # print(data.keys())
         flat_item = flatten_dict(data)
         return jax.tree.map(lambda k: flat_item[k], self.structure)
 
@@ -140,6 +141,8 @@ class Normalize(DataTransformFn):
         )
 
     def _normalize(self, x, stats: NormStats):
+        # print("X的维度是", x.shape)
+        # print("Stats的维度是", stats.mean.shape)
         return (x - stats.mean) / (stats.std + 1e-6)
 
     def _normalize_quantile(self, x, stats: NormStats):
@@ -405,6 +408,7 @@ def apply_tree(tree: at.PyTree[T],
 
 def pad_to_dim(x: np.ndarray, target_dim: int, axis: int = -1) -> np.ndarray:
     """Pad an array to the target dimension with zeros along the specified axis."""
+    # print(f"期望维度:{target_dim}, 实际维度:{x.shape[axis]}")
     current_dim = x.shape[axis]
     if current_dim < target_dim:
         pad_width = [(0, 0)] * len(x.shape)

@@ -89,6 +89,11 @@ class DataConfig:
 
     # If true, will disable syncing the dataset from the Hugging Face Hub. Allows training on local-only datasets.
     local_files_only: bool = False
+    
+    # If true, will replace gripper dimensions in state with action gripper values
+    replace_gripper_in_state: bool = False
+    # List of dimensions that correspond to grippers (e.g., [7, 15] for dual-arm robots)
+    gripper_dimensions: Sequence[int] = (7, 15)
 
 
 class GroupFactory(Protocol):
@@ -190,6 +195,66 @@ class SimpleDataConfig(DataConfigFactory):
             use_quantile_norm=model_config.model_type == ModelType.PI0_FAST,
         )
 
+@dataclasses.dataclass(frozen=False)
+class LeRobotAgiBotDataConfig(DataConfigFactory):
+    # If true, will convert joint dimensions to deltas with respect to the current state before passing to the model.
+    # Gripper dimensions will remain in absolute values.
+    use_delta_joint_actions: bool = True
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+    # If true, this will convert the joint and gripper values from the standard AgiBot space to
+    # the space used by the pi internal runtime which was used to train the base model.
+    adapt_to_pi: bool = False
+    # If true, will replace gripper dimensions in state with action gripper values (after normalization)
+    replace_gripper_in_state: bool = True
+    # Dimensions that correspond to grippers
+    gripper_dimensions: Sequence[int] = (7, 15)
+
+    # Repack transforms for AgiBot data format.
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(default=_transforms.Group(inputs=[
+        _transforms.RepackTransform({
+            "images": {
+                "head": "observation.images.head",
+                "hand_left": "observation.images.hand_left", 
+                "hand_right": "observation.images.hand_right",
+            },
+            "state": "observation.states",
+            "actions": "actions",
+            # "prompt": "prompt",
+        })
+    ]))
+    # Action keys that will be used to read the action sequence from the dataset.
+    action_sequence_keys: Sequence[str] = ("actions", )
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Import agibot_policy here to avoid circular imports
+        import openpi.policies.agibot_policy as agibot_policy
+        
+        data_transforms = _transforms.Group(
+            inputs=[agibot_policy.AgiBotInputs(action_dim=model_config.action_dim, adapt_to_pi=self.adapt_to_pi)],
+            outputs=[agibot_policy.AgiBotOutputs(adapt_to_pi=self.adapt_to_pi)],
+        )
+        if self.use_delta_joint_actions:
+            # AgiBot has 16 dimensions: 7 joints + 1 gripper for each arm
+            # Delta mask: joints=True, grippers=False
+            delta_action_mask = _transforms.make_bool_mask(7, -1, 7, -1)  # 7 joints, 1 gripper per arm
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+            replace_gripper_in_state=self.replace_gripper_in_state,
+            gripper_dimensions=self.gripper_dimensions,
+        )
 
 @dataclasses.dataclass(frozen=False)
 class LeRobotAlohaDataConfig(DataConfigFactory):
@@ -214,7 +279,7 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
         })
     ]))
     # Action keys that will be used to read the action sequence from the dataset.
-    action_sequence_keys: Sequence[str] = ("action", )
+    action_sequence_keys: Sequence[str] = ("actions", )
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -351,6 +416,8 @@ class TrainConfig:
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
 
+    image_path:str = "/dataset/SimDatas/"
+
     @property
     def assets_dirs(self) -> pathlib.Path:
         """Get the assets directory for this config."""
@@ -375,39 +442,55 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
-    ###
-    ### finetune config for robotwin
-    ###
     # pi0_base by lora
     TrainConfig(
         name="pi0_base_agibot_lora",
-        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
-        data=LeRobotAlohaDataConfig(
-            repo_id="test",  # your datasets repo_id
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+                            # action_dim=16,
+                            # action_horizon=10
+                            ),
+        data=LeRobotAgiBotDataConfig(
+            repo_id="/dataset/lerobot_dataset",  # your datasets repo_id
             adapt_to_pi=False,
             repack_transforms=_transforms.Group(inputs=[
                 _transforms.RepackTransform({
                     "images": {
-                        "cam_high": "observation.images.head",
-                        "cam_left_wrist": "observation.images.hand_left",
-                        "cam_right_wrist": "observation.images.hand_right",
+                        "head": "observation.images.head",
+                        "hand_left": "observation.images.hand_left", 
+                        "hand_right": "observation.images.hand_right",
                     },
                     "state": "observation.states",
                     "actions": "actions",
-                    "prompt": "prompt",
+                    # "prompt": "prompt",
                 })
             ]),
+            # repack_transforms=_transforms.Group(inputs=[
+            #     _transforms.RepackTransform({
+            #         # "images": {
+            #         #     "cam_high": "observation.images.head",
+            #         #     "cam_left_wrist": "observation.images.hand_left",
+            #         #     "cam_right_wrist": "observation.images.hand_right",
+            #         # },
+            #         "state": "observation.states",
+            #         "action": "actions",
+            #         # "prompt": "prompt",
+            #     })
+            # ]),
             base_config=DataConfig(
                 local_files_only=True,  # Set to True for local-only datasets.
                 prompt_from_task=True,  # Set to True for prompt by task_name
             ),
         ),
         freeze_filter=pi0.Pi0Config(paligemma_variant="gemma_2b_lora",
-                                    action_expert_variant="gemma_300m_lora").get_freeze_filter(),
+                                    action_expert_variant="gemma_300m_lora"
+                                    # action_dim=16,
+                                    # action_horizon=10
+                                    ).get_freeze_filter(),
         batch_size=32,  # the total batch_size not pre_gpu batch_size
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=30000,
+        num_train_steps=10000,
         fsdp_devices=1,  # refer line 359
+        num_workers=6
     ),
     # pi0_fast_base by lora
     TrainConfig(
@@ -445,65 +528,6 @@ _CONFIGS = [
         fsdp_devices=2,  # refer line 359
     ),
     # pi0_base by full
-    TrainConfig(
-        name="pi0_base_aloha_robotwin_full",
-        model=pi0.Pi0Config(),
-        data=LeRobotAlohaDataConfig(
-            repo_id="your_repo_id",  # your datasets repo_id
-            adapt_to_pi=False,
-            repack_transforms=_transforms.Group(inputs=[
-                _transforms.RepackTransform({
-                    "images": {
-                        "cam_high": "observation.images.cam_high",
-                        "cam_left_wrist": "observation.images.cam_left_wrist",
-                        "cam_right_wrist": "observation.images.cam_right_wrist",
-                    },
-                    "state": "observation.state",
-                    "actions": "action",
-                    "prompt": "prompt",
-                })
-            ]),
-            base_config=DataConfig(
-                local_files_only=True,  # Set to True for local-only datasets.
-                prompt_from_task=True,  # Set to True for prompt by task_name
-            ),
-        ),
-        freeze_filter=pi0.Pi0Config().get_freeze_filter(),
-        batch_size=32,  # the total batch_size not pre_gpu batch_size
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=30000,
-        fsdp_devices=4,  # refer line 359
-    ),
-    # pi0_fast_base by full
-    TrainConfig(
-        name="pi0_fast_aloha_robotwin_full",
-        model=pi0_fast.Pi0FASTConfig(),
-        data=LeRobotAlohaDataConfig(
-            repo_id="your_repo_id",  # your datasets repo_id
-            adapt_to_pi=False,
-            repack_transforms=_transforms.Group(inputs=[
-                _transforms.RepackTransform({
-                    "images": {
-                        "cam_high": "observation.images.cam_high",
-                        "cam_left_wrist": "observation.images.cam_left_wrist",
-                        "cam_right_wrist": "observation.images.cam_right_wrist",
-                    },
-                    "state": "observation.state",
-                    "actions": "action",
-                    "prompt": "prompt",
-                })
-            ]),
-            base_config=DataConfig(
-                local_files_only=True,  # Set to True for local-only datasets.
-                prompt_from_task=True,
-            ),
-        ),
-        freeze_filter=pi0_fast.Pi0FASTConfig(action_dim=14, action_horizon=10, max_token_len=300).get_freeze_filter(),
-        batch_size=32,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=30000,
-        fsdp_devices=1,  # refer line 359
-    ),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

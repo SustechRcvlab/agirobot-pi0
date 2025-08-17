@@ -6,6 +6,7 @@ from typing import Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
+# 我们定义的结构和原来的不一样 所以需要重新声明一个从lerobot_dataset出发的基类
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
@@ -13,10 +14,164 @@ import torch
 import openpi.models.model as _model
 import openpi.training.config as _config
 import openpi.transforms as _transforms
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset,LeRobotDatasetMetadata
+from pathlib import Path
+
+class AgiBotDataset(LeRobotDataset):
+    @classmethod
+    def create(
+        cls,
+        repo_id: str,
+        fps: int,
+        features: dict,
+        root: str | Path | None = None,
+        robot_type: str | None = None,
+        use_videos: bool = False,
+        tolerance_s: float = 1e-4,
+        image_writer_processes: int = 0,
+        image_writer_threads: int = 0,
+        video_backend: str | None = None,
+        image_path: str | None = None
+    ) -> "LeRobotDataset":
+        """Create a agibotworld LeRobot Dataset from scratch in order to record data."""
+        obj = cls.__new__(cls)
+        obj.meta = LeRobotDatasetMetadata.create(
+            repo_id=repo_id,
+            fps=fps,
+            robot_type=robot_type,
+            features=features,
+            root=root,
+            use_videos=use_videos
+        )
+        obj.repo_id = obj.meta.repo_id
+        obj.root = obj.meta.root
+        obj.revision = None
+        obj.tolerance_s = tolerance_s
+        obj.image_writer = None
+
+        if image_writer_processes or image_writer_threads:
+            obj.start_image_writer(image_writer_processes, image_writer_threads)
+
+        obj.episode_buffer = obj.create_episode_buffer()
+
+        obj.episodes = None
+        obj.hf_dataset = obj.create_hf_dataset()
+        obj.image_transforms = None
+        obj.delta_timestamps = None
+        obj.delta_indices = None
+        obj.episode_data_index = None
+        # obj.image_path = Path(image_path) if image_path else None
+        obj.image_path="/dataset/lerobot_dataset"
+
+        return obj
+
+    def __getitem__(self, idx: int) -> dict:
+        """Override the parent __getitem__ to include image loading from file paths."""
+        # Get the base item from parent class
+        item = super().__getitem__(idx)
+        
+        # Load images from file paths and add to item
+        image_data = self._query_images(None, idx)
+        # image_data = {}
+        # 在第75行，设置适当的空张量
+        # image_data = {
+        #     "observation.images.head": torch.zeros((3, 224, 224)),  # 根据实际尺寸调整
+        #     "observation.images.hand_left": torch.zeros((3, 224, 224)),
+        #     "observation.images.hand_right": torch.zeros((3, 224, 224))
+        # }
+
+        # Map the loaded images to the expected format
+        if image_data:
+            # Map camera names to expected keys
+            camera_mapping = {
+                "observation.images.head": "head",
+                "observation.images.hand_left": "hand_left", 
+                "observation.images.hand_right": "hand_right"
+            }
+            
+            for camera_key, image_tensor in image_data.items():
+                if camera_key in camera_mapping:
+                    expected_key = camera_mapping[camera_key]
+                    item[f"observation.images.{expected_key}"] = image_tensor
+            # print(f"observation images keys: {item.keys()}")
+        # reset some 
+        return item
+
+    def _query_images(self, query_indices: dict[str, list[int]] | None, idx: int) -> dict[str, torch.Tensor]:
+        """Load images directly from file paths constructed from observation.images.path data."""
+        item = {}
+
+        # Check if we have observation.images.path in the dataset
+        if "observation.images.path" not in self.hf_dataset.column_names:
+            return item
+
+        if query_indices is not None:
+            # Load multiple images for delta timestamps
+            if "observation.images.path" in query_indices:
+                selected_data = self.hf_dataset.select(query_indices["observation.images.path"])
+                path_arrays = selected_data["observation.images.path"]
+
+                all_images = {}
+                for camera_name in ["hand_left_color", "hand_right_color", "head_color"]:
+                    images = []
+                    for path_array in path_arrays:
+                        img_path = self._construct_image_path(path_array, camera_name)
+                        image = self._load_single_image(img_path)
+                        images.append(image)
+                    all_images[f"observation.images.{camera_name}"] = torch.stack(images)
+                item.update(all_images)
+        else:
+            # Load single image for current timestamp
+            path_array = self.hf_dataset[idx]["observation.images.path"]
+
+            # Load all camera images for current timestamp
+            for camera_name in ["hand_left_color", "hand_right_color", "head_color"]:
+                img_path = self._construct_image_path(path_array, camera_name)
+                key_name = camera_name.replace("_color", "")
+                item[f"observation.images.{key_name}"] = self._load_single_image(img_path)
+                # print(f"Add item observation.images.{key_name}")
+                # print("Keys:",item.keys())
+        # item['prompt'] = " "
+        return item
+
+    def _construct_image_path(self, path_array: list | torch.Tensor, camera_name: str) -> Path:
+        """Construct image path from path array and camera name."""
+        if isinstance(path_array, torch.Tensor):
+            path_array = path_array.tolist()
+
+        task_id, job_id, episode_id, frame_index = path_array
+        image_path = Path(f"/dataset/SimDatas/{task_id}/{job_id}/A2D0015AB00061/{episode_id}/camera/{frame_index}/{camera_name}.jpg")
+
+        return image_path
+
+    def _load_single_image(self, img_path: Path) -> torch.Tensor:
+        """Load a single image and convert to torch tensor."""
+        import PIL.Image
+
+        # Check if file exists
+        if not img_path.exists():
+            raise FileNotFoundError(f"Image file not found: {img_path}")
+
+        # Load image
+        image = PIL.Image.open(img_path).convert('RGB')
+
+        # Convert to numpy array and then to tensor [C, H, W] with values in [0, 1]
+        image_array = np.array(image, dtype=np.float32) / 255.0
+        image_tensor = torch.from_numpy(image_array).permute(2, 0, 1)
+
+        return image_tensor
+
+    def _query_hf_dataset(self, query_indices: dict[str, list[int]]) -> dict:
+        """Override to exclude image path from normal querying."""
+        return {
+            key: torch.stack(self.hf_dataset.select(q_idx)[key])
+            for key, q_idx in query_indices.items()
+            if key not in self.meta.video_keys and key != "observation.images.path"
+        }
 
 T_co = TypeVar("T_co", covariant=True)
 
-
+# class AgiLerobotDataset(lerobot_dataset.LeRobotDataset):
 class Dataset(Protocol[T_co]):
     """Interface for a dataset with random access."""
 
@@ -91,8 +246,10 @@ def create_dataset(data_config: _config.DataConfig, model_config: _model.BaseMod
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(root=repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id="",root=repo_id)
+    print(f"meta_data={dataset_meta}")
+    dataset = AgiBotDataset(
+        repo_id="",
         root=data_config.repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(model_config.action_horizon)]
@@ -100,30 +257,42 @@ def create_dataset(data_config: _config.DataConfig, model_config: _model.BaseMod
         },
     )
 
-    if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+    # if data_config.prompt_from_task:
+    #     dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
     return dataset
 
 
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
     """Transform the dataset by applying the data transforms."""
+    from openpi.transforms_gripper_replacement import ReplaceGripperInStatePostNorm
+    
     norm_stats = {}
+    #print("正在转换数据集")
     if data_config.repo_id != "fake" and not skip_norm_stats:
         if data_config.norm_stats is None:
             raise ValueError("Normalization stats not found. "
                              "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`.")
         norm_stats = data_config.norm_stats
 
-    return TransformedDataset(
-        dataset,
-        [
-            *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
-            _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
-            *data_config.model_transforms.inputs,
-        ],
-    )
+    transforms = [
+        *data_config.repack_transforms.inputs,
+        *data_config.data_transforms.inputs,
+        _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+    ]
+    
+    # Add gripper replacement transform after normalization if enabled
+    if data_config.replace_gripper_in_state:
+        gripper_replacement = ReplaceGripperInStatePostNorm(
+            gripper_dims=list(data_config.gripper_dimensions),
+            use_action_values=True
+        )
+        transforms.append(gripper_replacement)
+        print(f"Added gripper replacement transform for dimensions: {data_config.gripper_dimensions}")
+    
+    transforms.extend(data_config.model_transforms.inputs)
+
+    return TransformedDataset(dataset, transforms)
 
 
 def create_data_loader(
@@ -251,6 +420,7 @@ class TorchDataLoader:
         num_items = 0
         while True:
             data_iter = iter(self._data_loader)
+            # print(list(batch.keys()))
             while True:
                 if self._num_batches is not None and num_items >= self._num_batches:
                     return

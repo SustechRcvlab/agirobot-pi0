@@ -1,6 +1,6 @@
 import numpy as np
 from PIL import Image
-
+import torch
 
 def convert_to_uint8(img: np.ndarray) -> np.ndarray:
     """Converts an image to uint8 if it is a float image.
@@ -31,7 +31,14 @@ def resize_with_pad(images: np.ndarray, height: int, width: int, method=Image.BI
     original_shape = images.shape
 
     images = images.reshape(-1, *original_shape[-3:])
-    resized = np.stack([_resize_with_pad_pil(Image.fromarray(im), height, width, method=method) for im in images])
+    resized = np.stack([
+    _resize_with_pad_pil(
+        Image.fromarray(im.numpy() if isinstance(im, torch.Tensor) else im),
+        height, width, method=method
+    )
+    for im in images
+])
+    # resized = np.stack([_resize_with_pad_pil(Image.fromarray(im), height, width, method=method) for im in images])
     return resized.reshape(*original_shape[:-3], *resized.shape[-3:])
 
 
